@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import * as api from "./api";
 
@@ -200,7 +200,12 @@ export default function App() {
         {(vista === "hoy" || vista === "box") && <Hoy parte={vista} vitales={vitales} todosPacientes={data.pacientes} fecha={fecha} esp={esp} setEsp={setEsp} onVer={abrir} esApi={esApi} onCambio={cargar} onAviso={mostrarAviso} />}
         {vista === "criterios" && <Criterios />}
         {vista === "medico" && <MedicoDisponible fecha={fecha} esApi={esApi} espInicial={esp} onVer={abrir} onCambio={cargar} onAviso={mostrarAviso} />}
-        {vista === "indicadores" && <Indicadores fecha={fecha} esApi={esApi} data={data} />}
+        {vista === "indicadores" && (
+          <div className="flex flex-col gap-6">
+            <Indicadores fecha={fecha} esApi={esApi} data={data} />
+            <Estadisticas fecha={fecha} esp={esp} setEsp={setEsp} onVer={abrir} />
+          </div>
+        )}
         {vista === "cargar" && <CargarDatos esApi={esApi} onListo={async (r) => {
           await cargar();
           mostrarAviso({ titulo: `Datos cargados: ${r.resumen.pacientes_nuevos} pacientes nuevos, ${r.resumen.pacientes_actualizados} actualizados, ${r.resumen.eventos} eventos` });
@@ -780,6 +785,366 @@ function Ficha({ p, total, detalle, fecha, esApi, demo, onCambio, onAviso, onDes
         </ol>
       </Caja>}
     </>
+  );
+}
+
+// Estadísticas: analiza la curva de variación de la lista en el tiempo, por qué cambió (eventos clínicos)
+// y reutiliza el análisis por paciente (razones + evolución) para explicar los saltos de prioridad.
+const TIPO_LARGO = {
+  visita_urgencia: "Consulta en urgencia", hospitalizacion: "Hospitalización", examen_alterado: "Examen alterado",
+  cambio_farmaco: "Cambio de fármaco", control_aps: "Control en APS",
+};
+// Clasifica el subtipo/texto de un evento en una categoría legible, aunque venga de la API como texto suelto.
+function clasificarEvento(ev) {
+  if (!ev) return null;
+  if (ev.tipo_evento && TIPO_LARGO[ev.tipo_evento]) return TIPO_LARGO[ev.tipo_evento];
+  const s = `${ev.subtipo || ""} ${ev.tipo_evento || ""}`.toLowerCase();
+  if (s.includes("urgencia") || s.includes("esi")) return "Consulta en urgencia";
+  if (s.includes("hospital")) return "Hospitalización";
+  if (s.includes("examen") || s.includes("alterad")) return "Examen alterado";
+  if (s.includes("farmaco") || s.includes("fármaco") || s.includes("dosis")) return "Cambio de fármaco";
+  if (s.includes("aps") || s.includes("control")) return "Control en APS";
+  return "Otro evento clínico";
+}
+
+function Estadisticas({ fecha, esp, setEsp, onVer }) {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState(null);
+  const [cargando, setCargando] = useState(true);
+  const [expandido, setExpandido] = useState(null); // id del paciente cuya evolución se muestra en la lista de abajo
+  const [buscaEst, setBuscaEst] = useState("");
+  useEffect(() => {
+    let vivo = true;
+    setCargando(true); setErr(null);
+    api.getEstadisticas(fecha, esp === "Todas" ? null : esp)
+      .then((r) => { if (vivo) { setD(r); setCargando(false); } })
+      .catch((e) => { if (vivo) { setErr(e.message); setCargando(false); } });
+    return () => { vivo = false; };
+  }, [fecha, esp]);
+
+  if (cargando) return <p className="text-on-surface-variant">Analizando la evolución de la lista…</p>;
+  if (err) return <Caja><p className="text-error">No se pudieron cargar las estadísticas: {err}</p></Caja>;
+  if (!d || d.serie.length === 0) return <Caja><p className="text-on-surface-variant">Aún no hay historia suficiente para analizar.</p></Caja>;
+
+  const serie = d.serie;
+  const ini = serie[0], fin = serie[serie.length - 1];
+  const delta = (a, b) => b - a;
+
+  // Pacientes cuyo lugar en la lista mejoró respecto al corte anterior (subieron de prioridad / posición).
+  const subieron = d.pacientes
+    .filter((p) => p.posicion_anterior && p.posicion_anterior - p.posicion >= 10)
+    .map((p) => ({ ...p, salto: p.posicion_anterior - p.posicion }))
+    .sort((a, b) => b.salto - a.salto);
+
+  // Agrupa a los descompensados / que subieron por el tipo de evento que lo causó.
+  const causas = {};
+  for (const p of d.pacientes) {
+    if (p.estado_clinico !== "descompensado" && !(p.posicion_anterior && p.posicion_anterior - p.posicion >= 10)) continue;
+    const cat = clasificarEvento(p.evento_causa) || "Sin evento identificado";
+    causas[cat] = (causas[cat] || 0) + 1;
+  }
+  const causasOrden = Object.entries(causas).sort((a, b) => b[1] - a[1]);
+  const totalCausas = causasOrden.reduce((s, [, n]) => s + n, 0) || 1;
+
+  // Lista completa (en orden de la lista) con buscador, para expandir la evolución de cada paciente.
+  const q = buscaEst.trim().toLowerCase();
+  const listaPac = [...d.pacientes]
+    .sort((a, b) => a.posicion - b.posicion)
+    .filter((p) => !q || p.nombre_fantasia.toLowerCase().includes(q) || p.id_paciente.toLowerCase().includes(q) || (p.diagnostico_texto || "").toLowerCase().includes(q));
+
+  const Tarjeta = ({ titulo, valor, sub, tono }) => (
+    <section className={`bg-surface-container-lowest border rounded p-4 border-l-4 ${tono === "rojo" ? "border-l-error" : tono === "verde" ? "border-l-hlf" : "border-l-primary"} border-outline-variant`}>
+      <div className="text-[13px] text-on-surface-variant">{titulo}</div>
+      <div className="text-[30px] font-bold text-primary-container leading-tight mt-0.5">{valor}</div>
+      {sub && <div className="text-[13px] text-on-surface-variant mt-1">{sub}</div>}
+    </section>
+  );
+  const signo = (n) => (n > 0 ? `+${n}` : `${n}`);
+
+  return (
+    <div className="flex flex-col gap-5">
+      <Caja titulo="Estadísticas de la lista de espera"
+        accion={
+          <select value={esp} onChange={(e) => setEsp(e.target.value)} className="h-8 px-2 border border-outline-variant rounded bg-surface-container-lowest text-[13px]">
+            {ESPECIALIDADES.map((e) => <option key={e}>{e}</option>)}
+          </select>}>
+        <p className="text-[13px] text-on-surface-variant">
+          Evolución de la lista entre el <b>{fmt(ini.fecha)}</b> y el <b>{fmt(fin.fecha)}</b>
+          {esp !== "Todas" ? <> · especialidad <b>{esp}</b></> : null}. La lista es dinámica: cada evento clínico la reordena.
+        </p>
+      </Caja>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Tarjeta titulo="Pacientes en espera" valor={fin.total} sub={<>{signo(delta(ini.total, fin.total))} desde el inicio del período</>} />
+        <Tarjeta titulo="Prioridad alta" valor={fin.alta} tono="rojo" sub={<>{signo(delta(ini.alta, fin.alta))} desde el inicio · {Math.round((fin.alta / (fin.total || 1)) * 100)}% de la lista</>} />
+        <Tarjeta titulo="Descompensaciones graves" valor={fin.graves} tono="rojo" sub={<>Requieren evaluación médica en 72 h</>} />
+        <Tarjeta titulo="Egresos acumulados" valor={fin.excluidos} tono="verde" sub={<>{fin.atendidos} atendidos · {fin.fallecidos} fallecidos</>} />
+      </div>
+
+      <Caja titulo="Curva de variación: composición de la lista en el tiempo">
+        <GraficoComposicion serie={serie} />
+        <p className="text-[12px] text-on-surface-variant mt-2">
+          Cada franja es la cantidad de pacientes en cada prioridad al cierre de cada quincena. La línea roja marca cuántos
+          estaban con descompensación grave. Los cambios se explican por los eventos clínicos registrados (abajo).
+        </p>
+      </Caja>
+
+      <Caja titulo="Por qué cambió la lista: eventos que movieron la prioridad">
+        {causasOrden.length === 0 ? <p className="text-[13px] text-on-surface-variant">No hay cambios de prioridad por eventos en este corte.</p> : (
+          <div className="flex flex-col gap-2">
+            {causasOrden.map(([cat, n]) => (
+              <div key={cat} className="flex items-center gap-3 text-[14px]">
+                <span className="w-44 shrink-0">{cat}</span>
+                <div className="flex-1 h-4 rounded bg-surface-container-high overflow-hidden">
+                  <div className="h-full bg-primary" style={{ width: `${(n / totalCausas) * 100}%` }} />
+                </div>
+                <b className="w-10 text-right">{n}</b>
+              </div>
+            ))}
+            <p className="text-[12px] text-on-surface-variant mt-1">
+              {totalCausas} paciente{totalCausas !== 1 ? "s" : ""} con cambio de prioridad o descompensación, agrupados por el evento
+              clínico que lo originó (urgencia, hospitalización, examen alterado, etc.). El puntaje lo calculan reglas explicables; el evento es la causa.
+            </p>
+          </div>
+        )}
+      </Caja>
+
+      <Caja titulo={`Mayores saltos en la lista (${subieron.length})`}>
+        {subieron.length === 0 ? <p className="text-[13px] text-on-surface-variant">Nadie subió 10 o más puestos respecto al corte anterior.</p> : (
+          <div className="flex flex-col gap-2">
+            <p className="text-[13px] text-on-surface-variant">
+              Pacientes que avanzaron 10 o más puestos frente al corte anterior. Cada uno con el evento que lo explica. Haga clic para ver la ficha.
+            </p>
+            {subieron.slice(0, 12).map((p) => (
+              <button key={p.id_paciente} onClick={() => onVer(p.id_paciente)}
+                className="text-left border border-outline-variant rounded p-3 hover:bg-surface-container-low flex flex-wrap items-center gap-x-4 gap-y-1">
+                <div className="flex items-center gap-2 min-w-[220px]">
+                  <Prioridad cat={p.categoria} />
+                  <div>
+                    <div className="font-semibold text-[14px]">{p.nombre_fantasia} <span className="font-normal text-on-surface-variant">· {p.especialidad}</span></div>
+                    <div className="text-[13px] text-on-surface-variant">{p.diagnostico_cie10} {p.diagnostico_texto}</div>
+                  </div>
+                </div>
+                <div className="text-[14px] whitespace-nowrap">
+                  N° {p.posicion_anterior} <Icono n="arrow_forward" className="text-[16px] align-middle" /> <b className="text-hlf">N° {p.posicion}</b>
+                  <span className="text-error font-semibold ml-1">▲ {p.salto}</span>
+                </div>
+                <div className="text-[13px] flex-1 min-w-[200px]">
+                  {p.evento_causa
+                    ? <span><b>{clasificarEvento(p.evento_causa)}</b>{p.evento_causa.fecha_evento ? ` · ${fmt(p.evento_causa.fecha_evento)}` : ""}</span>
+                    : <span className="text-on-surface-variant">Antigüedad / orden de la lista</span>}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </Caja>
+
+      <Caja titulo="Lista completa: ver cómo se ha movido cada paciente"
+        accion={
+          <input value={buscaEst} onChange={(e) => setBuscaEst(e.target.value)} placeholder="Buscar nombre, ID o diagnóstico"
+            className="h-8 px-2 w-56 border border-outline-variant rounded text-[13px]" />}>
+        <p className="text-[13px] text-on-surface-variant mb-3">
+          Toda la lista en su orden actual. Haga clic en un paciente para ver su evolución (cómo cambió de puesto y de prioridad en el tiempo).
+          Para la ficha completa, use el botón «Ver ficha».
+        </p>
+        <div className="border border-outline-variant rounded overflow-hidden">
+          <table className="w-full text-left border-collapse text-[14px]">
+            <thead>
+              <tr className="bg-surface-container-low text-[13px] text-on-surface-variant border-b border-outline-variant">
+                <th className="py-2 px-3 font-semibold w-16">N°</th>
+                <th className="py-2 px-2 font-semibold">Prioridad</th>
+                <th className="py-2 px-3 font-semibold">Paciente / diagnóstico</th>
+                <th className="py-2 px-2 font-semibold text-right">Cambio</th>
+                <th className="py-2 px-3 font-semibold text-right">Espera</th>
+                <th className="py-2 px-2 font-semibold w-8" />
+              </tr>
+            </thead>
+            <tbody>
+              {listaPac.map((p) => {
+                const abierto = expandido === p.id_paciente;
+                const delta = p.posicion_anterior ? p.posicion_anterior - p.posicion : 0;
+                return (
+                  <Fragment key={p.id_paciente}>
+                    <tr onClick={() => setExpandido(abierto ? null : p.id_paciente)}
+                      className={`cursor-pointer border-b border-outline-variant/60 ${abierto ? "bg-primary/10" : "hover:bg-surface-container-low"}`}>
+                      <td className={`py-2.5 px-3 align-top font-semibold ${p.riesgo_vital ? "border-l-4 border-l-error" : "border-l-4 border-l-transparent"}`}>{p.posicion}</td>
+                      <td className="py-2.5 px-2 align-top"><Prioridad cat={p.categoria} /></td>
+                      <td className="py-2.5 px-3 align-top">
+                        <div className="font-semibold">{p.nombre_fantasia} <span className="font-normal text-on-surface-variant text-[13px]">· {p.edad} años</span></div>
+                        <div className="text-[13px] text-on-surface-variant">{p.especialidad} · {p.diagnostico_cie10} {p.diagnostico_texto}</div>
+                      </td>
+                      <td className="py-2.5 px-2 align-top text-right whitespace-nowrap">
+                        {delta > 0 ? <span className="text-error font-semibold">▲ {delta}</span>
+                          : delta < 0 ? <span className="text-on-surface-variant">▼ {-delta}</span>
+                          : <span className="text-on-surface-variant">—</span>}
+                      </td>
+                      <td className="py-2.5 px-3 align-top text-right whitespace-nowrap">{p.dias_espera} días</td>
+                      <td className="py-2.5 px-2 align-top text-on-surface-variant"><Icono n={abierto ? "expand_less" : "expand_more"} className="text-[20px]" /></td>
+                    </tr>
+                    {abierto && (
+                      <tr className="bg-surface-container-lowest">
+                        <td colSpan={6} className="px-4 py-3 border-b border-outline-variant">
+                          <div className="flex items-center justify-between mb-2">
+                            <h3 className="text-[14px] font-semibold">Evolución en la lista — {p.nombre_fantasia}</h3>
+                            <button onClick={(e) => { e.stopPropagation(); onVer(p.id_paciente); }}
+                              className="text-[13px] text-primary font-semibold flex items-center gap-1"><Icono n="open_in_new" className="text-[16px]" />Ver ficha</button>
+                          </div>
+                          <EvolucionPaciente p={p} fecha={fecha} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+          {listaPac.length === 0 && <p className="p-5 text-on-surface-variant text-[13px]">No hay pacientes con esa búsqueda.</p>}
+        </div>
+        <p className="text-[12px] text-on-surface-variant mt-2">{listaPac.length} de {d.pacientes.length} pacientes.</p>
+      </Caja>
+
+      <p className="text-[12px] text-on-surface-variant">
+        Datos al {fmt(d.fecha_corte)}. {d.modo === "mock" ? "Lista precalculada con el mismo motor de reglas que la API." : "Serie reconstruida desde la API, un corte por quincena."}
+        {" "}El sistema propone y explica según reglas oficiales; el equipo clínico decide.
+      </p>
+    </div>
+  );
+}
+
+// Carga la historia de un paciente (posición/categoría en el tiempo), dibuja el gráfico
+// y explica en detalle qué eventos hicieron subir su prioridad / posición en la lista.
+function EvolucionPaciente({ p, fecha }) {
+  const [h, setH] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    let vivo = true;
+    setH(null); setErr(null);
+    api.getHistoria(p.id_paciente, fecha).then((r) => { if (vivo) setH(r); }).catch((e) => { if (vivo) setErr(e.message); });
+    return () => { vivo = false; };
+  }, [p.id_paciente, fecha]);
+
+  // Razones indexadas por factor: traen el texto y la fuente oficial que ya calculó el motor de reglas.
+  const rz = Object.fromEntries((p.razones || []).map((r) => [r.factor, r]));
+  const subioTabla = rz.tabla_oficial && rz.tabla_oficial.valor.startsWith('"') && !rz.tabla_oficial.valor.includes("no supera");
+  // Eventos graves del timeline (los que empujan la prioridad), más recientes primero.
+  const eventosGraves = (h?.eventos || [])
+    .filter((e) => e.severidad === "grave" || (e.subtipo || "").toLowerCase().includes("descompensaci"))
+    .sort((a, b) => b.fecha_evento.localeCompare(a.fecha_evento));
+  const delta = p.posicion_anterior ? p.posicion_anterior - p.posicion : 0;
+
+  // Pasos de la explicación: de la prioridad inicial al lugar actual, señalando la causa de cada subida.
+  const pasos = [];
+  pasos.push({ icon: "flag", t: "Prioridad inicial", v: `${ETIQUETA[p.prioridad_inicial] || p.prioridad_inicial}`, d: "Asignada por el especialista al priorizar la interconsulta (SIC)." });
+  for (const e of eventosGraves) {
+    pasos.push({ icon: "emergency", rojo: true, t: `${TIPO_EVENTO[e.tipo_evento] || e.tipo_evento || "Evento clínico"}${e.fecha_evento ? ` · ${fmt(e.fecha_evento)}` : ""}`,
+      v: e.subtipo || "Descompensación", d: "Evento clínico registrado después de la interconsulta: es lo que gatilló la reevaluación." });
+  }
+  if (eventosGraves.length === 0 && rz.evento) {
+    pasos.push({ icon: "emergency", rojo: true, t: "Evento posterior a la interconsulta", v: rz.evento.valor, d: `Fuente: ${rz.evento.fuente}` });
+  }
+  if (subioTabla) {
+    pasos.push({ icon: "arrow_upward", rojo: true, t: "Subió de prioridad por la tabla oficial",
+      v: rz.tabla_oficial.valor.split("→").slice(-1)[0].trim(), d: `${rz.tabla_oficial.valor.split("→")[0].replaceAll('"', "").trim()} · Fuente: ${rz.tabla_oficial.fuente}` });
+  }
+  if (rz.riesgo_vital) {
+    pasos.push({ icon: "priority_high", rojo: true, t: "Descompensación grave", v: "Requiere evaluación médica en 72 h", d: rz.riesgo_vital.fuente });
+  }
+  if (rz.ges) pasos.push({ icon: "verified", t: "Garantía GES", v: rz.ges.valor, d: `Fuente: ${rz.ges.fuente}` });
+  if (rz.medicion) pasos.push({ icon: "monitor_heart", t: "Medición fuera de rango", v: rz.medicion.valor, d: `Fuente: ${rz.medicion.fuente}` });
+  if (rz.dias_espera) pasos.push({ icon: "schedule", t: "Tiempo de espera", v: rz.dias_espera.valor, d: `Fuente: ${rz.dias_espera.fuente}` });
+  pasos.push({ icon: "format_list_numbered", final: true, t: "Lugar actual en la lista",
+    v: `N° ${p.posicion}${p.posicion_anterior ? ` (antes N° ${p.posicion_anterior})` : ""}`,
+    d: delta > 0 ? `Subió ${delta} puesto${delta !== 1 ? "s" : ""} respecto al corte anterior.` : delta < 0 ? `Bajó ${-delta} puesto${-delta !== 1 ? "s" : ""} respecto al corte anterior.` : "Sin cambio de posición respecto al corte anterior." });
+
+  return (
+    <div className="flex flex-col gap-3">
+      {err ? <p className="text-[13px] text-error">No se pudo cargar la evolución: {err}</p>
+        : !h ? <p className="text-[13px] text-on-surface-variant">Cargando evolución…</p>
+        : <GraficoPosicion h={h} />}
+
+      <div>
+        <h4 className="text-[13px] font-semibold mb-2 flex items-center gap-1"><Icono n="trending_up" className="text-[18px]" />Por qué cambió su lugar en la lista</h4>
+        {delta > 0
+          ? <p className="text-[13px] mb-2">Subió <b className="text-error">{delta} puesto{delta !== 1 ? "s" : ""}</b> (de N° {p.posicion_anterior} a N° {p.posicion}){eventosGraves[0] ? <> por {TIPO_EVENTO[eventosGraves[0].tipo_evento]?.toLowerCase() || "un evento clínico"} del {fmt(eventosGraves[0].fecha_evento)}.</> : "."}</p>
+          : p.estado_clinico === "descompensado"
+            ? <p className="text-[13px] mb-2">Está en <b className="text-error">prioridad {ETIQUETA[p.categoria].toLowerCase()}</b> por una descompensación registrada después de la interconsulta.</p>
+            : <p className="text-[13px] mb-2 text-on-surface-variant">Mantiene su prioridad {ETIQUETA[p.categoria].toLowerCase()}; su lugar sigue el orden oficial de la lista.</p>}
+        <ol className="relative border-l-2 border-outline-variant/70 ml-2 pl-4 flex flex-col gap-3">
+          {pasos.map((s, i) => (
+            <li key={i} className="relative">
+              <span className={`absolute -left-[25px] top-0.5 w-5 h-5 rounded-full flex items-center justify-center ${s.rojo ? "bg-error text-on-error" : s.final ? "bg-primary text-on-primary" : "bg-surface-container-high text-on-surface-variant"}`}>
+                <Icono n={s.icon} className="text-[13px]" />
+              </span>
+              <div className="text-[12px] text-on-surface-variant">{s.t}</div>
+              <div className={`text-[14px] ${s.rojo ? "text-error font-semibold" : s.final ? "font-semibold" : ""}`}>{s.v}</div>
+              {s.d && <div className="text-[12px] text-on-surface-variant italic">{s.d}</div>}
+            </li>
+          ))}
+        </ol>
+      </div>
+    </div>
+  );
+}
+
+// Área apilada: cantidad de pacientes por prioridad (alta/media/baja) en cada corte + línea de descompensaciones graves.
+function GraficoComposicion({ serie }) {
+  const [hover, setHover] = useState(null);
+  if (serie.length < 2) return <p className="text-[13px] text-on-surface-variant">Aún no hay suficientes cortes para dibujar la curva.</p>;
+  const W = 720, H = 240, m = { l: 42, r: 14, t: 14, b: 28 };
+  const t = (f) => new Date(f + "T12:00:00").getTime();
+  const x0 = t(serie[0].fecha), x1 = t(serie[serie.length - 1].fecha);
+  const ymax = Math.max(...serie.map((s) => s.total), 1);
+  const X = (f) => m.l + ((t(f) - x0) / (x1 - x0 || 1)) * (W - m.l - m.r);
+  const Y = (v) => H - m.b - (v / ymax) * (H - m.t - m.b);
+  const ticks = [0, Math.round(ymax / 2), ymax];
+  const meses = [...new Set(serie.map((s) => s.fecha.slice(0, 7)))];
+  const nombreMes = (ym) => ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"][+ym.slice(5, 7) - 1];
+  // Área apilada de abajo hacia arriba: alta, media, baja.
+  const capas = [
+    { k: "alta", color: "rgb(var(--c-error))", base: (s) => 0 },
+    { k: "media", color: "rgb(var(--c-ambar))", base: (s) => s.alta },
+    { k: "baja", color: "rgb(var(--c-verde))", base: (s) => s.alta + s.media },
+  ];
+  const area = (capa) => {
+    const sup = serie.map((s) => `${X(s.fecha).toFixed(1)},${Y(capa.base(s) + s[capa.k]).toFixed(1)}`);
+    const inf = [...serie].reverse().map((s) => `${X(s.fecha).toFixed(1)},${Y(capa.base(s)).toFixed(1)}`);
+    return `M${sup.join(" L")} L${inf.join(" L")} Z`;
+  };
+  const lineaGraves = serie.map((s, i) => `${i ? "L" : "M"}${X(s.fecha).toFixed(1)},${Y(s.graves).toFixed(1)}`).join(" ");
+  const hs = hover != null ? serie[hover] : null;
+  return (
+    <div className="relative">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" role="img" aria-label="Composición de la lista de espera por prioridad a lo largo del tiempo">
+        {ticks.map((v) => (
+          <g key={v}>
+            <line x1={m.l} x2={W - m.r} y1={Y(v)} y2={Y(v)} stroke="rgb(var(--c-divider))" strokeWidth="1" />
+            <text x={m.l - 6} y={Y(v) + 4} textAnchor="end" fontSize="11" fill="rgb(var(--c-muted))">{v}</text>
+          </g>
+        ))}
+        {capas.map((c) => <path key={c.k} d={area(c)} fill={c.color} fillOpacity="0.55" stroke={c.color} strokeOpacity="0.8" strokeWidth="1" />)}
+        <path d={lineaGraves} fill="none" stroke="rgb(var(--c-error))" strokeWidth="2.5" strokeDasharray="4 3" />
+        {serie.map((s, i) => (
+          <g key={s.fecha} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
+            <rect x={X(s.fecha) - 8} y={m.t} width="16" height={H - m.t - m.b} fill="transparent" />
+            <circle cx={X(s.fecha)} cy={Y(s.graves)} r={hover === i ? 4 : 2.5} fill="rgb(var(--c-error))" />
+          </g>
+        ))}
+        {meses.map((ym) => { const xx = X(`${ym}-01` < serie[0].fecha ? serie[0].fecha : `${ym}-01`); return <text key={ym} x={xx} y={H - 8} fontSize="11" fill="rgb(var(--c-muted))" textAnchor="middle">{nombreMes(ym)}</text>; })}
+      </svg>
+      {hs && (
+        <div className="absolute pointer-events-none bg-on-surface text-background text-[12px] rounded px-2 py-1 shadow"
+          style={{ left: `${(X(hs.fecha) / W) * 100}%`, top: "4%", transform: "translate(-50%, 0)" }}>
+          {fmt(hs.fecha)} · {hs.total} en lista · alta {hs.alta} / media {hs.media} / baja {hs.baja} · {hs.graves} graves
+        </div>
+      )}
+      <div className="flex flex-wrap gap-3 text-[12px] text-on-surface-variant mt-1">
+        <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_HEX.alta }} />Prioridad alta</span>
+        <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_HEX.media }} />Media</span>
+        <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm" style={{ background: COLOR_HEX.baja }} />Baja</span>
+        <span className="flex items-center gap-1"><span className="w-3 border-t-2 border-dashed border-error" />Descompensaciones graves</span>
+      </div>
+    </div>
   );
 }
 
